@@ -93,10 +93,6 @@ function run_simulations(f, args...; n::Int)
     println("Mean for simulations: ", mean(results))
     println("Standard error for simulations: ", std(results) / sqrt(n))
 
-    # Plot the distribution
-    histogram(times, bins=30, title="Distribution of option price", xlabel="Value", ylabel="Frequency", legend=false)
-
     println("Mean simulation time: ", mean(times))
     return results, times
-    # TODO: calculate mean and standard error for vega and delta when using Dual numbers
 end

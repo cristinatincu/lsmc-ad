@@ -35,19 +35,19 @@ end
 
 
 # generate matrix of prices using GBM
-function simulate_paths(s0, r, σ, T, M, n_paths)
+function simulate_paths(s0, r, σ, T::Float64, M, P::Int64)
     # calculate in advance the constants
     Δt = T / M # time step
     a = (r - 0.5 * σ^2) * Δt
     b = σ * sqrt(Δt)
     s0_type = typeof(s0) # type of s0, can be float or dual
 
-    paths = zeros(s0_type, M + 1, n_paths) # path matrix
+    paths = zeros(s0_type, M + 1, P) # path matrix
     rands = zeros(Float64, M, 1) # vector of random numbers per path
 
     # iterate through paths
     # compiler optimisations make non-vectorised code more efficient
-    for i in 1:n_paths
+    for i in 1:P
         randn!(rands) # generate random numbers
         paths[1, i] = st = s0 # time point 1, i-th path
         for j in 1:M # iterate through time points
@@ -78,43 +78,81 @@ function mc_europ(s0, K, r, σ, T, M, P, is_put::Bool)
     return price
 end
 
-# Function to price an American option using the Binomial Tree method
-function binomial_tree_am(S0, K, r, T, σ, N, is_put::Bool)
+function binomial_tree_am(S0::Float64, K::Float64, r::Float64, σ::Float64, T::Float64, N::Int, option_type::String)
+    """
+    Binomial tree for American option pricing.
+    
+    Args:
+        S0: Initial stock price.
+        K: Strike price.
+        r: Risk-free interest rate.
+        σ: Volatility of the underlying asset.
+        T: Time to maturity.
+        N: Number of time steps in the binomial tree.
+        option_type: "call" or "put" to specify the option type.
+        
+    Returns:
+        Option price.
+    """
+    # Time step
     Δt = T / N
+
+    # Up and down factors
     u = exp(σ * sqrt(Δt))
     d = 1 / u
-    p = (exp(r * Δt) - d) / (u - d)
-    discount = exp(-r * Δt)
+
+    # Risk-neutral probability
+    q = (exp(r * Δt) - d) / (u - d)
+
+    # Discount factor
+    disc = exp(-r * Δt)
 
     # Initialize asset prices at maturity
-    asset_prices = [S0 * u^j * d^(N - j) for j in 0:N]
+    S = [S0 * u^(N - i) * d^i for i in 0:N]
 
     # Initialize option values at maturity
-    option_values = is_put ? max.(K .- asset_prices, 0) : max.(asset_prices .- K, 0)
+    if option_type == "call"
+        option_values = [max(S[i] - K, 0.0) for i in 1:(N + 1)]
+    elseif option_type == "put"
+        option_values = [max(K - S[i], 0.0) for i in 1:(N + 1)]
+    else
+        error("Invalid option type. Use 'call' or 'put'.")
+    end
 
-    # Step back through the tree
-    for i in N-1:-1:0
-        asset_prices = [S0 * u^j * d^(i - j) for j in 0:i]
-        option_values = [discount * (p * option_values[j+2] + (1 - p) * option_values[j+1]) for j in 0:i]
-        if is_put
-            option_values = [max(option_values[j+1], K - price) for (j, price) in enumerate(asset_prices)]
-        else
-            option_values = [max(option_values[j+1], price - K) for (j, price) in enumerate(asset_prices)]
+    # Backward induction through the tree
+    for t in N-1:-1:0
+        for i in 1:(t + 1)
+            # Calculate continuation value
+            continuation_value = disc * (q * option_values[i] + (1 - q) * option_values[i + 1])
+            
+            # Asset price at node (S0*u^(t-i)*d^i)
+            stock_price = S0 * u^(t - i + 1) * d^(i - 1)
+
+            # Exercise value
+            exercise_value = option_type == "call" ? max(stock_price - K, 0.0) : max(K - stock_price, 0.0)
+
+            # Take the maximum of continuation and exercise
+            option_values[i] = max(continuation_value, exercise_value)
         end
     end
 
-    return option_values[1]
+    return option_values[1]  # Option price at the root of the tree
 end
 
-function lsmc_am(S0, σ, K, r, T, N, P, is_put::Bool, plot_regr::Bool)
+# Function to compute paths and calculate the price of an American option using LSMC
+function lsmc_am(S0, σ, K, r, T, N, P, option_type::String, plot_regr::Bool)
     # simulate stock price paths
-    S = simulate_paths(S0, r, σ, T, N, best_paths)
+    S = simulate_paths(S0, r, σ, T, N, P)
+    return lsmc_am(S, K, r, T, N, P, option_type, plot_regr)
+end
 
-    df = round(exp(-r * T / N ), digits=5)  # discount factor per time step
+# Function to calculate the price of an American option using LSMC
+function lsmc_am(S, K, r, T, N, P, option_type::String, plot_regr::Bool)
+    df = exp(-r * T / N )  # discount factor per time step
 
     # Calculate the intrinsic values matrix,
     # needed for determining in-the-money options
-    V = is_put ? max.(K .- S, 0) : max.(S .- K, 0)
+    V = option_type == "put" ? max.(K .- S, 0) : max.(S .- K, 0)
 
     # initialise vector that keeps track of the values at stopping points,
     # starting with discounted option values at maturity
@@ -135,7 +173,7 @@ function lsmc_am(S0, σ, K, r, T, N, P, is_put::Bool, plot_regr::Bool)
         end 
 
         # multiply transposed A with β coefficients
-        continuation_values = A' * β  
+        continuation_values = A' * β
 
         for p in 1:P  # iterate through paths
             exercise_value = max(K - S[t, p], 0)  # exercise value for put option
@@ -150,7 +188,7 @@ function lsmc_am(S0, σ, K, r, T, N, P, is_put::Bool, plot_regr::Bool)
     end
 
     # Return the final option value
-    if is_put
+    if option_type == "put"
         price = max(mean(realised_cash_flow), K - S[1, 1])
     else
         price = max(mean(realised_cash_flow), S[1, 1] - K)
@@ -160,7 +198,7 @@ function lsmc_am(S0, σ, K, r, T, N, P, is_put::Bool, plot_regr::Bool)
 end
 
 # Function to compute delta using finite difference
-function compute_delta(S0, K, T, r, σ, N, P, is_put::Bool, h)
+function lsmc_delta(S0, K, T, r, σ, N, P, option_type::String, h)
     """
     Compute the delta of an American option using finite differences.
     S0: initial asset price
@@ -173,10 +211,12 @@ function compute_delta(S0, K, T, r, σ, N, P, is_put::Bool, h)
     is_put: boolean indicating if the option is a put
     h: small perturbation in asset price
     """
+    Random.seed!(42) # minimise noise (because 42 is the answer)
+
     # Price with S0 + h
-    price_up = lsmc_am(S0 + h, σ, K, r, T, N, P, is_put, false)
+    price_up = lsmc_am(S0 + h, σ, K, r, T, N, P, option_type, false)
     # Price with S0 - h
-    price_down = lsmc_am(S0 - h, σ + h, K, r, T, N, P, is_put, false)
+    price_down = lsmc_am(S0 - h, σ, K, r, T, N, P, option_type, false)
 
     # Central difference approximation for delta
     delta = (price_up - price_down) / (2 * h)
@@ -184,7 +224,7 @@ function compute_delta(S0, K, T, r, σ, N, P, is_put::Bool, h)
 end
 
 # Function to compute vega using finite difference
-function compute_vega(S0, K, T, r, σ, N, P, is_put::Bool, h)
+function lsmc_vega(S0, K, T, r, σ, N, P, option_type::String, h)
     """
     Compute the vega of an American option using finite differences.
     S0: initial asset price
@@ -197,11 +237,13 @@ function compute_vega(S0, K, T, r, σ, N, P, is_put::Bool, h)
     is_put: boolean indicating if the option is a put
     h: small perturbation in volatility
     """
+    Random.seed!(42) # minimise noise (because 42 is the answer)
+    
     # Price with sigma + h
-    price_up = lsmc_am(S0, σ + h, K, r, T, N, P, is_put, false)
+    price_up = lsmc_am(S0, σ + h, K, r, T, N, P, option_type, false)
 
     # Price with sigma - h
-    price_down = lsmc_am(S0, σ - h, K, r, T, N, P, is_put, false)
+    price_down = lsmc_am(S0, σ - h, K, r, T, N, P, option_type, false)
 
     # Central difference approximation for vega
     vega = (price_up - price_down) / (2 * h)
