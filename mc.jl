@@ -78,7 +78,7 @@ function mc_europ(s0, K, r, σ, T, M, P, is_put::Bool)
     return price
 end
 
-function binomial_tree_am(S0::Float64, K::Float64, r::Float64, σ::Float64, T::Float64, N::Int, option_type::String)
+function binomial_tree(S0::Float64, K::Float64, r::Float64, σ::Float64, T::Float64, N::Int, option_type::String)
     """
     Binomial tree for American option pricing.
     
@@ -94,60 +94,65 @@ function binomial_tree_am(S0::Float64, K::Float64, r::Float64, σ::Float64, T::F
     Returns:
         Option price.
     """
-    # Time step
-    Δt = T / N
+    dt = T / N
+    u = exp(σ * sqrt(dt))      # Up factor
+    d = 1 / u                      # Down factor
+    p = (exp(r * dt) - d) / (u - d)  # Risk-neutral probability
+    discount = exp(-r * dt)        # Discount factor
 
-    # Up and down factors
-    u = exp(σ * sqrt(Δt))
-    d = 1 / u
+    # Initialize stock price tree
+    stock_tree = zeros(Float64, N + 1, N + 1)
+    stock_tree[1, 1] = S0  # Root node
 
-    # Risk-neutral probability
-    q = (exp(r * Δt) - d) / (u - d)
-
-    # Discount factor
-    disc = exp(-r * Δt)
-
-    # Initialize asset prices at maturity
-    S = [S0 * u^(N - i) * d^i for i in 0:N]
-
-    # Initialize option values at maturity
-    if option_type == "call"
-        option_values = [max(S[i] - K, 0.0) for i in 1:(N + 1)]
-    elseif option_type == "put"
-        option_values = [max(K - S[i], 0.0) for i in 1:(N + 1)]
-    else
-        error("Invalid option type. Use 'call' or 'put'.")
-    end
-
-    # Backward induction through the tree
-    for t in N-1:-1:0
-        for i in 1:(t + 1)
-            # Calculate continuation value
-            continuation_value = disc * (q * option_values[i] + (1 - q) * option_values[i + 1])
-            
-            # Asset price at node (S0*u^(t-i)*d^i)
-            stock_price = S0 * u^(t - i + 1) * d^(i - 1)
-
-            # Exercise value
-            exercise_value = option_type == "call" ? max(stock_price - K, 0.0) : max(K - stock_price, 0.0)
-
-            # Take the maximum of continuation and exercise
-            option_values[i] = max(continuation_value, exercise_value)
+    for t in 1:N
+        for i in 1:t
+            stock_tree[i + 1, t + 1] = stock_tree[i, t] * d  # Down move
+            stock_tree[i, t + 1] = stock_tree[i, t] * u      # Up move
         end
     end
 
-    return option_values[1]  # Option price at the root of the tree
+    # Initialize option value tree
+    option_tree = zeros(Float64, N + 1, N + 1)
+
+    # Terminal payoff
+    for i in 1:N + 1
+        option_tree[i, N + 1] = option_type == "put" ? max(K - stock_tree[i, N + 1], 0.0) : max(stock_tree[i, N + 1] - K, 0.0)
+    end
+
+    # Backward induction and exercise boundary extraction
+    exercise_boundary = fill(NaN, N + 1)
+
+    for t in N:-1:1
+        for i in 1:t
+            # Continuation value
+            continuation = discount * (p * option_tree[i, t + 1] + (1 - p) * option_tree[i + 1, t + 1])
+
+            # Immediate payoff
+            immediate_payoff = option_type == "put" ? max(K - stock_tree[i, t], 0.0) : max(stock_tree[i, t] - K, 0.0)
+
+            # Option value at this node
+            option_tree[i, t] = max(immediate_payoff, continuation)
+
+            # Update exercise boundary
+            if isnan(exercise_boundary[t]) && immediate_payoff > continuation
+                exercise_boundary[t] = stock_tree[i, t]
+            end
+        end
+    end
+
+    return option_tree[1, 1], exercise_boundary  # Option price at the root of the tree
 end
 
+
 # Function to compute paths and calculate the price of an American option using LSMC
-function lsmc_am(S0, σ, K, r, T, N, P, option_type::String, plot_regr::Bool)
+function lsmc(S0::Union{Float64, Dual}, σ::Union{Float64, Dual}, K::Float64, r::Float64, T::Float64, N::Int64, P::Int64, option_type::String, num_basis, plot_regr::Bool)
     # simulate stock price paths
     S = simulate_paths(S0, r, σ, T, N, P)
-    return lsmc_am(S, K, r, T, N, P, option_type, plot_regr)
+    return lsmc(S, K, r, T, N, P, option_type, num_basis, plot_regr)
 end
 
 # Function to calculate the price of an American option using LSMC
-function lsmc_am(S, K, r, T, N, P, option_type::String, plot_regr::Bool)
+function lsmc(S::Matrix, K::Float64, r::Float64, T::Float64, N::Int64, P::Int64, option_type::String, num_basis::Int64, plot_regr::Bool)
     df = exp(-r * T / N )  # discount factor per time step
 
     # Calculate the intrinsic values matrix,
@@ -158,11 +163,13 @@ function lsmc_am(S, K, r, T, N, P, option_type::String, plot_regr::Bool)
     # starting with discounted option values at maturity
     realised_cash_flow = V[end, :] .* df
 
+    exercise_boundary = zeros(typeof(S[1,1]), N)  # Initialize boundary array
+
     for t in N:-1:2  # iterate backwards through time points
         in_the_money = V[t, :] .!= 0  # consider only in-the-money options
         
         # Construct polynomial basis matrix up to 3rd degree
-        A = [x^d for d in 0:3, x in S[t, :]] # each row corresponds to a path
+        A = [x^d for d in 0:num_basis, x in S[t, :]] # each row corresponds to a path
 
         # Perform least-squares regression to estimate continuation values
         # see https://en.wikipedia.org/wiki/QR_decomposition - julia specific implementation
@@ -175,30 +182,32 @@ function lsmc_am(S, K, r, T, N, P, option_type::String, plot_regr::Bool)
         # multiply transposed A with β coefficients
         continuation_values = A' * β
 
+        # store exercise decision in a vector
+        exercise_decision = []
         for p in 1:P  # iterate through paths
-            exercise_value = max(K - S[t, p], 0)  # exercise value for put option
+            immediate_payoff = option_type == "put" ? max(K - S[t, p], 0) : max(S[t, p] - K, 0) # exercise value for put option
 
             # Update option values based on exercise and continuation values
-            if in_the_money[p] && continuation_values[p] < exercise_value
-                realised_cash_flow[p] = exercise_value * df  # discount the exercise value
+            if in_the_money[p] && continuation_values[p] < immediate_payoff
+                realised_cash_flow[p] = immediate_payoff * df  # discount the exercise value
+                push!(exercise_decision, S[t, p])
             else
                 realised_cash_flow[p] *= df  # discount the intrinsic value
             end
         end
+
+        # Identify the exercise boundary
+        exercise_boundary[t] = length(exercise_decision) > 0 ? minimum(exercise_decision) : NaN
     end
 
+    initial_intrinsic_value = option_type == "put" ? max(K - S[1, 1], 0) : max(S[1, 1] - K, 0)
+
     # Return the final option value
-    if option_type == "put"
-        price = max(mean(realised_cash_flow), K - S[1, 1])
-    else
-        price = max(mean(realised_cash_flow), S[1, 1] - K)
-    end
-    print_option_price(price)
-    return price
+    return max(mean(realised_cash_flow), initial_intrinsic_value), exercise_boundary
 end
 
 # Function to compute delta using finite difference
-function lsmc_delta(S0, K, T, r, σ, N, P, option_type::String, h)
+function lsmc_delta(S0, K, T, r, σ, N, P, option_type::String, num_basis::Int64, h)
     """
     Compute the delta of an American option using finite differences.
     S0: initial asset price
@@ -208,23 +217,22 @@ function lsmc_delta(S0, K, T, r, σ, N, P, option_type::String, h)
     σ: volatility
     N: number of steps
     P: number of paths
-    is_put: boolean indicating if the option is a put
+    option_type: "put" or "call" option type
     h: small perturbation in asset price
     """
-    Random.seed!(42) # minimise noise (because 42 is the answer)
+    #Random.seed!(42) # minimise noise (because 42 is the answer)
 
     # Price with S0 + h
-    price_up = lsmc_am(S0 + h, σ, K, r, T, N, P, option_type, false)
+    price_up = lsmc(S0 + h, σ, K, r, T, N, P, option_type, num_basis, false)
     # Price with S0 - h
-    price_down = lsmc_am(S0 - h, σ, K, r, T, N, P, option_type, false)
+    price_down = lsmc(S0 - h, σ, K, r, T, N, P, option_type, num_basis, false)
 
     # Central difference approximation for delta
-    delta = (price_up - price_down) / (2 * h)
-    return delta
+    return (price_up - price_down) / (2 * h)
 end
 
 # Function to compute vega using finite difference
-function lsmc_vega(S0, K, T, r, σ, N, P, option_type::String, h)
+function lsmc_vega(S0, K, T, r, σ, N, P, option_type::String, num_basis::Int64, h)
     """
     Compute the vega of an American option using finite differences.
     S0: initial asset price
@@ -234,18 +242,17 @@ function lsmc_vega(S0, K, T, r, σ, N, P, option_type::String, h)
     σ: volatility
     N: number of steps
     P: number of paths
-    is_put: boolean indicating if the option is a put
+    option_type: "put" or "call" option type
     h: small perturbation in volatility
     """
-    Random.seed!(42) # minimise noise (because 42 is the answer)
+    #Random.seed!(42) # minimise noise (because 42 is the answer)
     
     # Price with sigma + h
-    price_up = lsmc_am(S0, σ + h, K, r, T, N, P, option_type, false)
+    price_up = lsmc(S0, σ + h, K, r, T, N, P, option_type, num_basis, false)
 
     # Price with sigma - h
-    price_down = lsmc_am(S0, σ - h, K, r, T, N, P, option_type, false)
+    price_down = lsmc(S0, σ - h, K, r, T, N, P, option_type, num_basis, false)
 
     # Central difference approximation for vega
-    vega = (price_up - price_down) / (2 * h)
-    return vega
+    return (price_up - price_down) / (2 * h)
 end

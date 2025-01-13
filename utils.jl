@@ -74,7 +74,6 @@ function plot_conditional_expectation(stock_price::Vector{Dual{Nothing, Float64,
     display(plot!(plot_x, g.(plot_x), label="Regression", color="red", linewidth=5))
 end
 
-
 # Function to calculate the mean and standard error of n simulations
 function run_simulations(f, args...; n::Int)
     # Determine the type of the result
@@ -90,9 +89,25 @@ function run_simulations(f, args...; n::Int)
         push!(times, elapsed_time)
     end
 
-    println("Mean for simulations: ", mean(results))
-    println("Standard error for simulations: ", std(results) / sqrt(n))
-
     println("Mean simulation time: ", mean(times))
     return results, times
+end
+
+# Function to perform Statistical analysis on the results
+function statistical_analysis(results, num_simulations, benchmark=0)
+    rmse = sqrt(mean((results .- benchmark).^2))
+    mean_price = mean(results)
+    std_dev = std(results)
+    std_error = std_dev / sqrt(num_simulations)
+
+    # Confidence interval (95%)
+    lower_bound = mean_price - 1.96 * std_error
+    upper_bound = mean_price + 1.96 * std_error
+
+    # Display results
+    println("Root Mean Squared Error: $rmse")
+    println("Mean Option Price: $mean_price")
+    println("Standard Deviation: $std_dev")
+    println("Standard Error: $std_error")
+    println("95% Confidence Interval: ($lower_bound, $upper_bound)")
 end
